@@ -1,2 +1,5 @@
 fastapi
 uvicorn
+PyJWT
+pytest
+httpx2
