@@ -5,19 +5,43 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
+import json
 import os
 from pathlib import Path
+from typing import Dict
+
+import jwt
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+security = HTTPBearer()
+JWT_SECRET = os.getenv("JWT_SECRET", "development-secret-change-me-at-least-32-bytes")
+JWT_ALGORITHM = "HS256"
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def load_teachers() -> Dict[str, Dict[str, str]]:
+    teachers_file = current_dir / "teachers.json"
+    with teachers_file.open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+teachers = load_teachers()
 
 # In-memory activity database
 activities = {
@@ -78,9 +102,60 @@ activities = {
 }
 
 
+def create_access_token(username: str, role: str) -> str:
+    payload = {
+        "sub": username,
+        "role": role,
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def require_teacher(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> Dict[str, str]:
+    invalid_credentials = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid authentication credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+        )
+    except jwt.InvalidTokenError as exc:
+        raise invalid_credentials from exc
+
+    username = payload.get("sub")
+    role = payload.get("role")
+
+    if not username or role != "teacher":
+        raise invalid_credentials
+
+    return {"username": username, "role": role}
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
+
+
+@app.post("/auth/login")
+def login(payload: LoginRequest):
+    teacher = teachers.get(payload.username)
+    if not teacher or teacher.get("password") != payload.password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password",
+        )
+
+    access_token = create_access_token(payload.username, teacher.get("role", "teacher"))
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+    }
 
 
 @app.get("/activities")
@@ -89,8 +164,13 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    current_user: Dict[str, str] = Depends(require_teacher),
+):
     """Sign up a student for an activity"""
+    del current_user
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +191,13 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    current_user: Dict[str, str] = Depends(require_teacher),
+):
     """Unregister a student from an activity"""
+    del current_user
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
